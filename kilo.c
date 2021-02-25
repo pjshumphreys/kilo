@@ -38,7 +38,6 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
-#include <termios.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -52,7 +51,11 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <fcntl.h>
-#include <signal.h>
+
+#define ENOENT 255
+#define STDIN_FILENO           0
+#define STDOUT_FILENO          1
+#define STDERR_FILENO          2
 
 /* Syntax highlight types */
 #define HL_NORMAL 0
@@ -71,9 +74,9 @@
 struct editorSyntax {
     char **filematch;
     char **keywords;
-    char singleline_comment_start[2];
-    char multiline_comment_start[3];
-    char multiline_comment_end[3];
+    //char singleline_comment_start[2];
+    //char multiline_comment_start[3];
+    //char multiline_comment_end[3];
     int flags;
 };
 
@@ -188,25 +191,122 @@ char *C_HL_keywords[] = {
 struct editorSyntax HLDB[] = {
     {
         /* C / C++ */
-        C_HL_extensions,
-        C_HL_keywords,
-        "//","/*","*/",
+        &C_HL_extensions,
+        &C_HL_keywords,
+        //"//",
+        //"/*",
+        //"*/",
         HL_HIGHLIGHT_STRINGS | HL_HIGHLIGHT_NUMBERS
     }
 };
 
 #define HLDB_ENTRIES (sizeof(HLDB)/sizeof(HLDB[0]))
 
+
+ssize_t getline(char** ws, ssize_t linecap, FILE* stream) {
+  char buf[80];
+  char* newWs = NULL;
+  char* potentialNewWs = NULL;
+  size_t totalLength = (size_t)0;
+  size_t potentialTotalLength = (size_t)0;
+  size_t bufferLength;
+
+  /* check sanity of inputs */
+  if(ws == NULL) {
+    return 0;
+  }
+
+  /* try reading some text from the file into the buffer */
+  while(fgets((char *)&(buf[0]), 80, stream) != NULL) {
+
+    /* get the length of the string in the buffer */
+    bufferLength = strlen((char *)&(buf[0]));
+
+    /*
+      add it to the potential new length.
+      this might not become the actual new length if the realloc fails
+    */
+    potentialTotalLength+=bufferLength;
+
+    /*
+      try reallocating the output string to be a bit longer
+      if it fails then set any existing buffer to the return value and return true
+    */
+    if((potentialNewWs = (char*)realloc(newWs, ((potentialTotalLength+1)*sizeof(char)))) == NULL) {
+
+      /* if we've already retrieved some text */
+      if(newWs != NULL) {
+
+        /* ensure null termination of the string */
+        newWs[totalLength] = '\0';
+
+        /* set the output string pointer and return true */
+        if(*ws) {
+          free(*ws);
+        }
+        *ws = newWs;
+
+        return totalLength;
+      }
+
+      /*
+        otherwise no successful allocation was made.
+        return false without modifying the output string location
+      */
+      return 0;
+    }
+
+    /* copy the buffer data into potentialNewWs */
+    memcpy(potentialNewWs+totalLength, &buf, bufferLength*sizeof(char));
+
+    /* the potential new string becomes the actual one */
+    totalLength = potentialTotalLength;
+    newWs = potentialNewWs;
+
+    /* if the last character is '\n' (ie we've reached the end of a line) then return the result */
+    if(newWs[totalLength-1] == '\n') {
+
+      /* ensure null termination of the string */
+      newWs[totalLength-1] = '\0';
+
+      /* set the output string pointer and return true */
+      if(*ws) {
+        free(*ws);
+      }
+
+      *ws = newWs;
+
+      return totalLength;
+    }
+  }
+
+  /* if we've already retrieved some text */
+  if(newWs != NULL) {
+    /* ensure null termination of the string */
+    newWs[totalLength] = '\0';
+
+    /* set the output string point and return true */
+    if(*ws) {
+      free(*ws);
+    }
+    *ws = newWs;
+
+    return totalLength;
+  }
+
+  /*
+    otherwise no successful allocation was made.
+    return false without modifying the output string location
+  */
+  return 0;
+}
+
+
+
 /* ======================= Low level terminal handling ====================== */
 
-static struct termios orig_termios; /* In order to restore at exit.*/
 
 void disableRawMode(int fd) {
-    /* Don't even check the return value as it's too late. */
-    if (E.rawmode) {
-        tcsetattr(fd,TCSAFLUSH,&orig_termios);
-        E.rawmode = 0;
-    }
 }
 
 /* Called at exit to avoid remaining in raw mode. */
@@ -216,36 +316,7 @@ void editorAtExit(void) {
 
 /* Raw mode: 1960 magic shit. */
 int enableRawMode(int fd) {
-    struct termios raw;
-
-    if (E.rawmode) return 0; /* Already enabled. */
-    if (!isatty(STDIN_FILENO)) goto fatal;
-    atexit(editorAtExit);
-    if (tcgetattr(fd,&orig_termios) == -1) goto fatal;
-
-    raw = orig_termios;  /* modify the original mode */
-    /* input modes: no break, no CR to NL, no parity check, no strip char,
-     * no start/stop output control. */
-    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    /* output modes - disable post processing */
-    raw.c_oflag &= ~(OPOST);
-    /* control modes - set 8 bit chars */
-    raw.c_cflag |= (CS8);
-    /* local modes - choing off, canonical off, no extended functions,
-     * no signal chars (^Z,^C) */
-    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-    /* control chars - set return condition: min number of bytes and timer. */
-    raw.c_cc[VMIN] = 0; /* Return each byte, or zero for timeout. */
-    raw.c_cc[VTIME] = 1; /* 100 ms timeout (unit is tens of second). */
-
-    /* put terminal in raw mode after flushing */
-    if (tcsetattr(fd,TCSAFLUSH,&raw) < 0) goto fatal;
-    E.rawmode = 1;
-    return 0;
-
-fatal:
-    errno = ENOTTY;
-    return -1;
+  return 0;
 }
 
 /* Read a key from the terminal put in raw mode, trying to handle
@@ -329,36 +400,9 @@ int getCursorPosition(int ifd, int ofd, int *rows, int *cols) {
  * call fails the function will try to query the terminal itself.
  * Returns 0 on success, -1 on error. */
 int getWindowSize(int ifd, int ofd, int *rows, int *cols) {
-    struct winsize ws;
-
-    if (ioctl(1, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
-        /* ioctl() failed. Try to query the terminal itself. */
-        int orig_row, orig_col, retval;
-
-        /* Get the initial position so we can restore it later. */
-        retval = getCursorPosition(ifd,ofd,&orig_row,&orig_col);
-        if (retval == -1) goto failed;
-
-        /* Go to right/bottom margin and get position. */
-        if (write(ofd,"\x1b[999C\x1b[999B",12) != 12) goto failed;
-        retval = getCursorPosition(ifd,ofd,rows,cols);
-        if (retval == -1) goto failed;
-
-        /* Restore position. */
-        char seq[32];
-        snprintf(seq,32,"\x1b[%d;%dH",orig_row,orig_col);
-        if (write(ofd,seq,strlen(seq)) == -1) {
-            /* Can't recover... */
-        }
-        return 0;
-    } else {
-        *cols = ws.ws_col;
-        *rows = ws.ws_row;
-        return 0;
-    }
-
-failed:
-    return -1;
+    *cols = 32;
+    *rows = 24;
+    return 0;
 }
 
 /* ====================== Syntax highlight color scheme  ==================== */
@@ -388,9 +432,9 @@ void editorUpdateSyntax(erow *row) {
     int i, prev_sep, in_string, in_comment;
     char *p;
     char **keywords = E.syntax->keywords;
-    char *scs = E.syntax->singleline_comment_start;
-    char *mcs = E.syntax->multiline_comment_start;
-    char *mce = E.syntax->multiline_comment_end;
+    char *scs = "//";
+    char *mcs = "/*";
+    char *mce = "*/";
 
     /* Point to the first non-space char. */
     p = row->render;
@@ -593,7 +637,11 @@ void editorInsertRow(int at, char *s, size_t len) {
     if (at > E.numrows) return;
     E.row = realloc(E.row,sizeof(erow)*(E.numrows+1));
     if (at != E.numrows) {
-        memmove(E.row+at+1,E.row+at,sizeof(E.row[0])*(E.numrows-at));
+        memmove(
+        E.row+at+1,
+        E.row+at,
+        sizeof(struct erow)*(E.numrows-at)
+        );
         for (int j = at+1; j <= E.numrows; j++) E.row[j].idx++;
     }
     E.row[at].size = len;
@@ -624,7 +672,7 @@ void editorDelRow(int at) {
     if (at >= E.numrows) return;
     row = E.row+at;
     editorFreeRow(row);
-    memmove(E.row+at,E.row+at+1,sizeof(E.row[0])*(E.numrows-at-1));
+    memmove(E.row+at,E.row+at+1,sizeof(struct erow)*(E.numrows-at-1));
     for (int j = at; j < E.numrows-1; j++) E.row[j].idx++;
     E.numrows--;
     E.dirty++;
@@ -816,9 +864,11 @@ int editorOpen(char *filename) {
     size_t linecap = 0;
     ssize_t linelen;
     while((linelen = getline(&line,&linecap,fp)) != -1) {
-        if (linelen && (line[linelen-1] == '\n' || line[linelen-1] == '\r'))
-            line[--linelen] = '\0';
-        editorInsertRow(E.numrows,line,linelen);
+      if (linelen && (line[linelen-1] == '\n' || line[linelen-1] == '\r')) {
+        line[--linelen] = '\0';
+      }
+
+      editorInsertRow(E.numrows,line,linelen);
     }
     free(line);
     fclose(fp);
@@ -835,7 +885,6 @@ int editorSave(void) {
 
     /* Use truncate + a single write(2) call in order to make saving
      * a bit safer, under the limits of what we can do in a small editor. */
-    if (ftruncate(fd,len) == -1) goto writeerr;
     if (write(fd,buf,len) != len) goto writeerr;
 
     close(fd);
@@ -847,7 +896,7 @@ int editorSave(void) {
 writeerr:
     free(buf);
     if (fd != -1) close(fd);
-    editorSetStatusMessage("Can't save! I/O error: %s",strerror(errno));
+    editorSetStatusMessage("Can't save! I/O error: %d",errno);
     return 1;
 }
 
@@ -1002,7 +1051,7 @@ void editorRefreshScreen(void) {
 void editorSetStatusMessage(const char *fmt, ...) {
     va_list ap;
     va_start(ap,fmt);
-    vsnprintf(E.statusmsg,sizeof(E.statusmsg),fmt,ap);
+    vsnprintf(E.statusmsg,sizeof(E.statusmsg),va_ptr(ap,char *),ap);
     va_end(ap);
     E.statusmsg_time = time(NULL);
 }
@@ -1267,13 +1316,6 @@ void updateWindowSize(void) {
     E.screenrows -= 2; /* Get room for status bar. */
 }
 
-void handleSigWinCh(int unused __attribute__((unused))) {
-    updateWindowSize();
-    if (E.cy > E.screenrows) E.cy = E.screenrows - 1;
-    if (E.cx > E.screencols) E.cx = E.screencols - 1;
-    editorRefreshScreen();
-}
-
 void initEditor(void) {
     E.cx = 0;
     E.cy = 0;
@@ -1285,7 +1327,6 @@ void initEditor(void) {
     E.filename = NULL;
     E.syntax = NULL;
     updateWindowSize();
-    signal(SIGWINCH, handleSigWinCh);
 }
 
 int main(int argc, char **argv) {
